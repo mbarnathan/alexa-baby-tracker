@@ -59,8 +59,8 @@ DIAPER_STATUS = {
 def lambda_handler(event, context):
     # Ensure that we're being called by the expected application.
     application_id = CONFIG["application_id"]
-    if APPLICATION_ID is not None and (
-            event["session"]["application"]["applicationId"] != APPLICATION_ID):
+    if application_id is not None and (
+            event["session"]["application"]["applicationId"] != application_id):
         raise ValueError("Invalid Application ID")
 
     if event["request"]["type"] == "LaunchRequest":
