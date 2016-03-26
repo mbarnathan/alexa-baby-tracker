@@ -10,10 +10,14 @@ import json
 import requests
 import uuid
 
+from Crypto.Cipher import PKCS1_OAEP
+from Crypto.PublicKey import RSA
+
 URL = "https://prodapp.babytrackers.com"
+KEY_FILENAME = "oauth_passthrough.key"
 
 CONFIG = json.load(open("config.json"))
-assert set(CONFIG.keys()) == {"device_id", "email_address", "password", "application_id"}
+assert set(CONFIG.keys()) == {"device_id", "application_id"}
 
 # TODO: load this from the baby tracker server
 BABY_DATA = json.load(open("baby_data.json"))
@@ -29,22 +33,61 @@ assert set(BABY_DATA.keys()) == {
     "objectID",
 }
 
-# TODO: figure out what portion of this is required
-LOGIN_DATA = {
-    "Device": {
-        "DeviceOSInfo": "Alexa",
-        "DeviceName": "Baby Tracker Alexa App",
-        # TODO: grab something from either the Alexa device or the lambda function
-        "DeviceUUID": CONFIG["device_id"]
-    },
-    # TODO: I don't know what this means
-    "AppInfo": {
-        "AppType": 0,
-        "AccountType": 0
-    },
-    "Password": CONFIG["password"],
-    "EmailAddress": CONFIG["email_address"]
-}
+def login_data(session):
+    encoded_encrypted_token = session["user"].get("accessToken")
+    if encoded_encrypted_token is None:
+        print("No token provided.")
+        return None
+
+    try:
+        encrypted_token = base64.b64decode(encoded_encrypted_token)
+    except TypeError:
+        print("Token incorrectly encoded.")
+        return None
+
+    key = RSA.importKey(open(KEY_FILENAME).read())
+    cipher = PKCS1_OAEP.new(key)
+
+    try:
+        token = cipher.decrypt(encrypted_token)
+    except ValueError:
+        print("Token wasn't validly encrypted.")
+        return None
+
+    try:
+        password_data = json.loads(token)
+    except ValueError:
+        print("Token wasn't valid json.")
+        return None
+
+    try:
+        email_address = password_data["email"]
+    except KeyError:
+        print("Token was missing the 'email' field.")
+        return None
+
+    try:
+        password = password_data["password"]
+    except KeyError:
+        print("Token was missing the 'password' field.")
+        return None
+
+    # TODO: figure out what portion of this is required
+    return {
+        "Device": {
+            "DeviceOSInfo": "Alexa",
+            "DeviceName": "Baby Tracker Alexa App",
+            # TODO: grab something from either the Alexa device or the lambda function
+            "DeviceUUID": CONFIG["device_id"]
+        },
+        # TODO: I don't know what this means
+        "AppInfo": {
+            "AppType": 0,
+            "AccountType": 0
+        },
+        "Password": password,
+        "EmailAddress": email_address
+    }
 
 DIAPER_STATUS = {
     "wet": 0,
@@ -109,6 +152,22 @@ def build_speechlet_response(title, output, reprompt_text=None, should_end_sessi
         }
     return result
 
+def build_link_account_response():
+    output = (
+        "Your account needs to be linked to Baby Tracker. Please use the Alexa "
+        "app on your phone to do this."
+    )
+    return {
+        "outputSpeech": {
+            "type": "PlainText",
+            "text": output
+        },
+        "card": {
+            "type": "LinkAccount"
+        },
+        "shouldEndSession": True
+    }
+
 def build_response(response):
     # right now we don't use sessionAttributes
     return {
@@ -159,9 +218,10 @@ def last_sync_id(session):
             return device["LastSyncID"]
     return 0
 
-def record_diaper(status):
+def record_diaper(status, login_data_):
     session = requests.Session()
-    r = session.post(URL + "/session", data=json.dumps(LOGIN_DATA))
+    # TODO: validate that we successfully connected.
+    r = session.post(URL + "/session", data=json.dumps(login_data_))
     sync_id = last_sync_id(session) + 1
     session.post(URL + "/account/transaction", data=json.dumps(generate_diaper_sync_data(status, sync_id)))
 
@@ -169,7 +229,10 @@ def record_diaper(status):
 
 def record_diaper_intent(intent, session):
     diaper_type = intent["slots"]["DiaperType"]["value"]
-    record_diaper(DIAPER_STATUS[diaper_type])
+    login_data_ = login_data(session)
+    if login_data_ is None:
+        return build_response(build_link_account_response())
+    record_diaper(DIAPER_STATUS[diaper_type], login_data_)
     return build_response(build_speechlet_response(
         "Record Diaper", "{} diaper recorded.".format(diaper_type)))
 
