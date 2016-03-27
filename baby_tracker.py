@@ -127,7 +127,7 @@ def build_speechlet_response(title, output, reprompt_text=None, should_end_sessi
     result = {
         "outputSpeech": {
             "type": "PlainText",
-            "ssml": output
+            "text": output
         },
         "card": {
             "type": "Simple",
