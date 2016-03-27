@@ -21,7 +21,6 @@ rsync -r ec2-user@YOUR_EC2_INSTANCE_IP:/usr/lib64/python2.7/dist-packages/Crypto
 and
 ```
 {
-{
     "dueDay": "YYYY-mm-dd HH:MM:SS +0000",
     "BCObjectType": "Baby",
     "gender": "false", # true = boy?
