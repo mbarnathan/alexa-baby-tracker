@@ -15,7 +15,6 @@ rsync -r ec2-user@YOUR_EC2_INSTANCE_IP:/usr/lib64/python2.7/dist-packages/Crypto
 * Create data files for your config and your baby. These should be json files names `config.json` and `baby_data.json` respectively. They should be formatted like
 ```
 {
-    "device_id": "String", # some UUID
     "application_id": "String" # id of your Alexa App, or null
 }
 ```

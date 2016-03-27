@@ -17,7 +17,7 @@ URL = "https://prodapp.babytrackers.com"
 KEY_FILENAME = "oauth_passthrough.key"
 
 CONFIG = json.load(open("config.json"))
-assert set(CONFIG.keys()) == {"device_id", "application_id"}
+assert set(CONFIG.keys()) == {"application_id"}
 
 # TODO: load this from the baby tracker server
 BABY_DATA = json.load(open("baby_data.json"))
@@ -77,8 +77,7 @@ def login_data(session):
         "Device": {
             "DeviceOSInfo": "Alexa",
             "DeviceName": "Baby Tracker Alexa App",
-            # TODO: grab something from either the Alexa device or the lambda function
-            "DeviceUUID": CONFIG["device_id"]
+            "DeviceUUID": session["application"]["applicationId"]
         },
         # TODO: I don't know what this means
         "AppInfo": {
@@ -214,7 +213,7 @@ def last_sync_id(session):
     response = session.get(URL + "/account/device")
     devices = json.loads(response.text)
     for device in devices:
-        if device["DeviceUUID"] == CONFIG["device_id"]:
+        if device["DeviceUUID"] == session["application"]["applicationId"]
             return device["LastSyncID"]
     return 0
 
