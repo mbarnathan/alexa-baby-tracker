@@ -14,7 +14,7 @@ from enum import Enum
 import requests
 from Crypto.Cipher import PKCS1_OAEP
 from Crypto.PublicKey import RSA
-from typing import Union
+from typing import Union, Tuple
 
 from isodate import Duration
 
@@ -32,15 +32,16 @@ class Breast(Enum):
 
 URL = "https://prodapp.babytrackers.com"
 KEY_FILENAME = "oauth_passthrough.key"
-
 CONFIG = json.load(open("config.json"))
-assert set(CONFIG.keys()) == {"application_id"}
+
+DEVICE_UUID = CONFIG["device_uuid"]
+EMAIL = CONFIG.get("email")
+PASSWORD = CONFIG.get("password")
 
 # TODO: load this from the baby tracker server
 BABY_DATA = json.load(open("baby_data.json"))
 assert set(BABY_DATA.keys()) == {
     "dueDay",
-    "BCObjectType",
     "gender",
     "pictureName",
     "dob",
@@ -50,7 +51,8 @@ assert set(BABY_DATA.keys()) == {
     "objectID",
 }
 
-def login_data(session):
+
+def credentials_from_oauth(session) -> Tuple[str, str, str]:
     encoded_encrypted_token = session["user"].get("accessToken")
     if encoded_encrypted_token is None:
         print("No token provided.")
@@ -89,12 +91,16 @@ def login_data(session):
         print("Token was missing the 'password' field.")
         return None
 
+    return email_address, password, session["application"]["applicationId"]
+
+
+def login_data(email_address, password, device_uuid):
     # TODO: figure out what portion of this is required
     return {
         "Device": {
             "DeviceOSInfo": "Alexa",
             "DeviceName": "Baby Tracker Alexa App",
-            "DeviceUUID": session["application"]["applicationId"]
+            "DeviceUUID": device_uuid
         },
         # TODO: I don't know what this means
         "AppInfo": {
@@ -104,6 +110,7 @@ def login_data(session):
         "Password": password,
         "EmailAddress": email_address
     }
+
 
 DIAPER_STATUS = {
     "wet": 0,
@@ -140,9 +147,11 @@ def on_intent(intent_request, session):
     if intent_name == "Diaper" or intent_name == "RecordDiaperIntent":
         return record_diaper_intent(intent, session)
     elif intent_name == "Pee":
-        pass
+        return record_diaper_intent(intent, session, "wet")
     elif intent_name == "Poo":
-        pass
+        return record_diaper_intent(intent, session, "dirty")
+    elif intent_name == "Mixed":
+        return record_diaper_intent(intent, session, "mixed")
     elif intent_name == "Formula":
         pass
     elif intent_name == "Nursing":
@@ -214,6 +223,12 @@ def _time(dt: datetime.datetime = None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S +0000")
 
 
+def login(login_data_) -> requests.Session:
+    session = requests.Session()
+    session.post(URL + "/session", data=json.dumps(login_data_))
+    return session
+
+
 def generate_diaper_data(status):
     return {
         "BCObjectType": "Diaper",
@@ -242,7 +257,8 @@ def generate_diaper_data(status):
 
 def generate_diaper_sync_data(status, sync_id):
     return {
-        "Transaction": base64.b64encode(json.dumps(generate_diaper_data(status))),
+        "Transaction": base64.b64encode(json.dumps(generate_diaper_data(status)).encode("utf-8"))
+                             .decode("utf-8"),
         "SyncID": sync_id,
         # This is sometimes 0, sometimes 1. Not sure if ever higher. Not sure what it's for.
         "OPCode": 0
@@ -300,29 +316,36 @@ def last_sync_id(session):
     response = session.get(URL + "/account/device")
     devices = json.loads(response.text)
     for device in devices:
-        if device["DeviceUUID"] == session["application"]["applicationId"]:
+        if device["DeviceUUID"] == DEVICE_UUID:
             return device["LastSyncID"]
     return 0
 
-def record_diaper(status, login_data_):
-    session = requests.Session()
-    # TODO: validate that we successfully connected.
-    r = session.post(URL + "/session", data=json.dumps(login_data_))
-    sync_id = last_sync_id(session) + 1
-    session.post(URL + "/account/transaction", data=json.dumps(generate_diaper_sync_data(status, sync_id)))
+
+def record_diaper(status: Union[int, str], login_data_):
+    if status is None:
+        raise KeyError("Invalid diaper type")
+
+    if isinstance(status, str):
+        status = DIAPER_STATUS[status]
+
+    with login(login_data_) as session:
+        # TODO: validate that we successfully connected.
+        sync_id = last_sync_id(session) + 1
+        session.post(URL + "/account/transaction",
+                     data=json.dumps(generate_diaper_sync_data(status, sync_id)))
 
 ## Intents -- these are somewhere between being on the Alexa side and being on the Baby Tracker side
 
-def record_diaper_intent(intent, session):
-    diaper_type = intent["slots"]["DiaperType"]["value"]
-    login_data_ = login_data(session)
+def record_diaper_intent(intent, session, diaper_type: Union[int, str] = None):
+    diaper_type = diaper_type or intent["slots"]["DiaperType"]["value"]
+    login_data_ = login_data(EMAIL, PASSWORD, DEVICE_UUID)
     if login_data_ is None:
         return build_response(build_link_account_response())
-    record_diaper(DIAPER_STATUS[diaper_type], login_data_)
+    record_diaper(diaper_type, login_data_)
     return build_response(build_speechlet_response(
         "Record Diaper", "{} diaper recorded.".format(diaper_type)))
 
 
 if __name__ == "__main__":
     # record a wet diaper
-    record_diaper(0)
+    record_diaper(0, login_data(EMAIL, PASSWORD, DEVICE_UUID))
