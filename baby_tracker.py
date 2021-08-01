@@ -8,25 +8,27 @@ import base64
 import datetime
 import json
 import uuid
-import isodate
 from enum import Enum
-
-import requests
-from Crypto.Cipher import PKCS1_OAEP
-from Crypto.PublicKey import RSA
 from typing import Union, Tuple
 
-from isodate import Duration
+import isodate
+import requests
 
 
+# Define singular values; the app will pluralize them as needed.
 class Unit(Enum):
-    ML = 0,
-    OZ = 1,
-    CUPS = 2
+    MILLILITER = "milliliter"
+    MILLILITERS = "milliliter"
+    ML = "milliliter"
+    OUNCE = "ounce"
+    OUNCES = "ounce"
+    OZ = "ounce"
+    CUP = "cup"
+    CUPS = "cup"
 
 
 class Breast(Enum):
-    LEFT = 1,
+    LEFT = 1
     RIGHT = 2
 
 
@@ -53,6 +55,8 @@ assert set(BABY_DATA.keys()) == {
 
 
 def credentials_from_oauth(session) -> Tuple[str, str, str]:
+    from Crypto.Cipher import PKCS1_OAEP
+    from Crypto.PublicKey import RSA
     encoded_encrypted_token = session["user"].get("accessToken")
     if encoded_encrypted_token is None:
         print("No token provided.")
@@ -145,17 +149,17 @@ def on_intent(intent_request, session):
     intent_name = intent_request["intent"]["name"]
 
     if intent_name == "Diaper" or intent_name == "RecordDiaperIntent":
-        return record_diaper_intent(intent, session)
+        return record_diaper_intent(intent)
     elif intent_name == "Pee":
-        return record_diaper_intent(intent, session, "wet")
+        return record_diaper_intent(intent, "wet")
     elif intent_name == "Poo":
-        return record_diaper_intent(intent, session, "dirty")
+        return record_diaper_intent(intent, "dirty")
     elif intent_name == "Mixed":
-        return record_diaper_intent(intent, session, "mixed")
+        return record_diaper_intent(intent, "mixed")
     elif intent_name == "Formula":
-        pass
+        return record_formula_intent(intent)
     elif intent_name == "Nursing":
-        pass
+        return record_nursing_intent(intent)
 
     raise ValueError("Invalid intent")
 
@@ -225,7 +229,10 @@ def _time(dt: datetime.datetime = None) -> str:
 
 def login(login_data_) -> requests.Session:
     session = requests.Session()
-    session.post(URL + "/session", data=json.dumps(login_data_))
+    response = session.post(URL + "/session", data=json.dumps(login_data_))
+    if response.text == "Account has been reset. Please login again":
+        # TODO(mb): Write persistent new UUID to storage; the old one will no longer work.
+        raise PermissionError(response.text)
     return session
 
 
@@ -255,9 +262,9 @@ def generate_diaper_data(status):
     }
 
 
-def generate_diaper_sync_data(status, sync_id):
+def generate_transaction(transaction_data, sync_id):
     return {
-        "Transaction": base64.b64encode(json.dumps(generate_diaper_data(status)).encode("utf-8"))
+        "Transaction": base64.b64encode(json.dumps(transaction_data).encode("utf-8"))
                              .decode("utf-8"),
         "SyncID": sync_id,
         # This is sometimes 0, sometimes 1. Not sure if ever higher. Not sure what it's for.
@@ -287,14 +294,14 @@ def generate_formula_data(amount: float, unit: Unit = Unit.ML):
     }
 
 
-def generate_nursing_data(duration: Union[str, int, datetime.timedelta, Duration],
+def generate_nursing_data(duration: Union[str, int, datetime.timedelta, isodate.Duration],
                           breast: Breast = None):
     if isinstance(duration, str):
         duration = isodate.parse_duration(duration)
     elif isinstance(duration, int) or isinstance(duration, float):
         duration = datetime.timedelta(minutes=round(duration))
 
-    minutes = duration.total_seconds() / 60.0
+    minutes = round(duration.total_seconds() / 60.0)
     return {
         "BCObjectType": "Nursing",
         "bothDuration": minutes if breast is None else 0,
@@ -314,6 +321,8 @@ def generate_nursing_data(duration: Union[str, int, datetime.timedelta, Duration
 
 def last_sync_id(session):
     response = session.get(URL + "/account/device")
+    if response.text == "Unauthorized":
+        raise PermissionError("Couldn't authenticate with BabyTracker")
     devices = json.loads(response.text)
     for device in devices:
         if device["DeviceUUID"] == DEVICE_UUID:
@@ -329,23 +338,72 @@ def record_diaper(status: Union[int, str], login_data_):
         status = DIAPER_STATUS[status]
 
     with login(login_data_) as session:
-        # TODO: validate that we successfully connected.
         sync_id = last_sync_id(session) + 1
         session.post(URL + "/account/transaction",
-                     data=json.dumps(generate_diaper_sync_data(status, sync_id)))
+                     data=json.dumps(generate_transaction(generate_diaper_data(status), sync_id)))
 
-## Intents -- these are somewhere between being on the Alexa side and being on the Baby Tracker side
 
-def record_diaper_intent(intent, session, diaper_type: Union[int, str] = None):
+def record_formula(amount: float, unit: Unit, login_data_):
+    formula_data = generate_formula_data(amount, unit)
+    with login(login_data_) as session:
+        sync_id = last_sync_id(session) + 1
+        session.post(URL + "/account/transaction",
+                     data=json.dumps(generate_transaction(formula_data, sync_id)))
+
+
+def record_nursing(duration: Union[str, int, datetime.timedelta, isodate.Duration],
+                   breast: Breast,
+                   login_data_):
+    nursing_data = generate_nursing_data(duration, breast)
+    with login(login_data_) as session:
+        sync_id = last_sync_id(session) + 1
+        session.post(URL + "/account/transaction",
+                     data=json.dumps(generate_transaction(nursing_data, sync_id)))
+
+
+# Intents -- these are somewhere between being on the Alexa side and being on the Baby Tracker side
+def record_diaper_intent(intent, diaper_type: Union[int, str] = None):
+    baby = intent["slots"]["Baby"]["value"]
     diaper_type = diaper_type or intent["slots"]["DiaperType"]["value"]
     login_data_ = login_data(EMAIL, PASSWORD, DEVICE_UUID)
     if login_data_ is None:
         return build_response(build_link_account_response())
     record_diaper(diaper_type, login_data_)
     return build_response(build_speechlet_response(
-        "Record Diaper", "{} diaper recorded.".format(diaper_type)))
+        "Record Diaper", f"{baby} had a {diaper_type} diaper."))
+
+
+def record_formula_intent(intent):
+    baby = intent["slots"]["Baby"]["value"]
+    amount = float(intent["slots"]["number"]["value"])
+    unit_str = str(intent["slots"]["unit"]["value"]).upper()
+    unit = Unit[unit_str]
+    login_data_ = login_data(EMAIL, PASSWORD, DEVICE_UUID)
+    if login_data_ is None:
+        return build_response(build_link_account_response())
+    record_formula(amount, unit, login_data_)
+    plural = "" if amount == 1 else "s"
+    return build_response(build_speechlet_response(
+        "Record Formula", f"{baby} drank {amount:0.3g} {unit.value}{plural} of formula."))
+
+
+def record_nursing_intent(intent):
+    baby = intent["slots"]["Baby"]["value"]
+    duration = float(intent["slots"]["duration"]["value"])
+    direction_str = str(intent["slots"]["direction"]["value"]).upper()
+    direction = Breast.get(direction_str)
+    direction_speech = f" on the {direction_str}" if direction else ""
+    login_data_ = login_data(EMAIL, PASSWORD, DEVICE_UUID)
+    if login_data_ is None:
+        return build_response(build_link_account_response())
+    record_nursing(duration, direction, login_data_)
+    plural = "" if duration == 1 else "s"
+    return build_response(build_speechlet_response(
+        "Record Nursing", f"{baby} fed {duration} minute{plural}{direction_speech}."))
 
 
 if __name__ == "__main__":
-    # record a wet diaper
-    record_diaper(0, login_data(EMAIL, PASSWORD, DEVICE_UUID))
+    # record_diaper(0, login_data(EMAIL, PASSWORD, DEVICE_UUID))
+    # record_formula(1.5, Unit.OZ, login_data(EMAIL, PASSWORD, DEVICE_UUID))
+    record_nursing("PT5M", Breast.RIGHT, login_data(EMAIL, PASSWORD, DEVICE_UUID))
+
