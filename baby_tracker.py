@@ -7,11 +7,28 @@ http://nighp.com/babytracker/
 import base64
 import datetime
 import json
-import requests
 import uuid
+import isodate
+from enum import Enum
 
+import requests
 from Crypto.Cipher import PKCS1_OAEP
 from Crypto.PublicKey import RSA
+from typing import Union
+
+from isodate import Duration
+
+
+class Unit(Enum):
+    ML = 0,
+    OZ = 1,
+    CUPS = 2
+
+
+class Breast(Enum):
+    LEFT = 1,
+    RIGHT = 2
+
 
 URL = "https://prodapp.babytrackers.com"
 KEY_FILENAME = "oauth_passthrough.key"
@@ -96,7 +113,9 @@ DIAPER_STATUS = {
     "dry": 3
 }
 
+
 ## Generic Alexa -- this is pretty generic Alexa boilerplate.
+
 
 def lambda_handler(event, context):
     # Ensure that we're being called by the expected application.
@@ -118,8 +137,17 @@ def on_intent(intent_request, session):
     intent = intent_request["intent"]
     intent_name = intent_request["intent"]["name"]
 
-    if intent_name == "RecordDiaperIntent":
+    if intent_name == "Diaper" or intent_name == "RecordDiaperIntent":
         return record_diaper_intent(intent, session)
+    elif intent_name == "Pee":
+        pass
+    elif intent_name == "Poo":
+        pass
+    elif intent_name == "Formula":
+        pass
+    elif intent_name == "Nursing":
+        pass
+
     raise ValueError("Invalid intent")
 
 def build_speechlet_response(title, output, reprompt_text=None, should_end_session=True):
@@ -176,23 +204,33 @@ def build_response(response):
 
 ## Baby Tracker Sync -- these functions are on the Baby Tracker side of the skill.
 
+
+def _object_id() -> str:
+    return str(uuid.uuid1())
+
+
+def _time(dt: datetime.datetime = None) -> str:
+    dt = dt or datetime.datetime.utcnow()
+    return dt.strftime("%Y-%m-%d %H:%M:%S +0000")
+
+
 def generate_diaper_data(status):
     return {
         "BCObjectType": "Diaper",
         # These default to 5s on some apps (iPhone, I think) and 0s on others (Android?).
         # They don't seem to be used anywhere, though, so the values we set here don't
         # seem important.
-        "pooColor": 5,
-        "peeColor": 5,
+        "pooColor": 0,
+        "peeColor": 0,
         "note": "",
         # now
-        "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S +0000"),
+        "timestamp": _time(),
         "newFlage": "true",
         "pictureLoaded": "true",
         # Time of diaper. We could let people provide this time, but at the moment
         # there doesn't seem like a lot of benefit.
-        "time": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S +0000"),
-        "objectID": str(uuid.uuid1()),
+        "time": _time(),
+        "objectID": _object_id(),
         "texture": 5,
         "amount": 2,
         "baby": BABY_DATA,
@@ -200,6 +238,7 @@ def generate_diaper_data(status):
         "pictureNote": [],
         "status": status
     }
+
 
 def generate_diaper_sync_data(status, sync_id):
     return {
@@ -209,11 +248,59 @@ def generate_diaper_sync_data(status, sync_id):
         "OPCode": 0
     }
 
+
+def generate_formula_data(amount: float, unit: Unit = Unit.ML):
+    if unit == Unit.CUPS:
+        unit = Unit.OZ
+        amount *= 8
+
+    return {
+      "BCObjectType": "Formula",
+      "amount": {
+        "englishMeasure": str(unit == Unit.OZ).lower(),
+        "value": amount
+      },
+      "baby": BABY_DATA,
+      "note": "",
+      "pictureLoaded": "true",
+      "pictureNote": [],
+      "time": _time(),
+      "newFlage": "true",
+      "objectID": _object_id(),
+      "timestamp": _time()
+    }
+
+
+def generate_nursing_data(duration: Union[str, int, datetime.timedelta, Duration],
+                          breast: Breast = None):
+    if isinstance(duration, str):
+        duration = isodate.parse_duration(duration)
+    elif isinstance(duration, int) or isinstance(duration, float):
+        duration = datetime.timedelta(minutes=round(duration))
+
+    minutes = duration.total_seconds() / 60.0
+    return {
+        "BCObjectType": "Nursing",
+        "bothDuration": minutes if breast is None else 0,
+        "finishSide": breast.value if breast else "0",
+        "leftDuration": minutes if breast == Breast.LEFT else 0,
+        "rightDuration": minutes if breast == Breast.RIGHT else 0,
+        "baby": BABY_DATA,
+        "note": "",
+        "pictureLoaded": "true",
+        "pictureNote": [],
+        "time": _time(datetime.datetime.utcnow() - duration),
+        "newFlage": "true",
+        "objectID": _object_id(),
+        "timestamp": _time()
+    }
+
+
 def last_sync_id(session):
     response = session.get(URL + "/account/device")
     devices = json.loads(response.text)
     for device in devices:
-        if device["DeviceUUID"] == session["application"]["applicationId"]
+        if device["DeviceUUID"] == session["application"]["applicationId"]:
             return device["LastSyncID"]
     return 0
 
@@ -234,6 +321,7 @@ def record_diaper_intent(intent, session):
     record_diaper(DIAPER_STATUS[diaper_type], login_data_)
     return build_response(build_speechlet_response(
         "Record Diaper", "{} diaper recorded.".format(diaper_type)))
+
 
 if __name__ == "__main__":
     # record a wet diaper
