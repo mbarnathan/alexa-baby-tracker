@@ -8,6 +8,7 @@ import base64
 import datetime
 import json
 import uuid
+from abc import ABCMeta, abstractmethod
 from enum import Enum
 from typing import Union, Tuple
 
@@ -119,7 +120,7 @@ DIAPER_STATUS = {
 }
 
 
-## Generic Alexa -- this is pretty generic Alexa boilerplate.
+# Generic Alexa -- this is pretty generic Alexa boilerplate.
 
 
 def lambda_handler(event, context):
@@ -129,11 +130,7 @@ def lambda_handler(event, context):
             event["session"]["application"]["applicationId"] != application_id):
         raise ValueError("Invalid Application ID")
 
-    if event["request"]["type"] == "LaunchRequest":
-        # TODO: Give a reasonable welcome speech.
-        #return on_launch(event["request"], event["session"])
-        pass
-    elif event["request"]["type"] == "IntentRequest":
+    if event["request"]["type"] == "IntentRequest":
         return on_intent(event["request"], event["session"])
 
 
@@ -141,22 +138,11 @@ def on_intent(intent_request, session):
     """ Called when the user specifies an intent for this skill """
 
     intent = intent_request["intent"]
-    intent_name = intent_request["intent"]["name"]
+    credentials = login_data(EMAIL, PASSWORD, DEVICE_UUID)
+    if credentials is None:
+        return build_response(build_link_account_response())
 
-    if intent_name == "Diaper" or intent_name == "RecordDiaperIntent":
-        return record_diaper_intent(intent)
-    elif intent_name == "Pee":
-        return record_diaper_intent(intent, "wet")
-    elif intent_name == "Poo":
-        return record_diaper_intent(intent, "dirty")
-    elif intent_name == "Mixed":
-        return record_diaper_intent(intent, "mixed")
-    elif intent_name == "Formula":
-        return record_formula_intent(intent)
-    elif intent_name == "Nursing":
-        return record_nursing_intent(intent)
-
-    raise ValueError("Invalid intent")
+    return Intent.map(intent, credentials).record()
 
 
 def build_speechlet_response(title, output, reprompt_text=None, should_end_session=True):
@@ -191,8 +177,7 @@ def build_speechlet_response(title, output, reprompt_text=None, should_end_sessi
 
 def build_link_account_response():
     output = (
-        "Your account needs to be linked to Baby Tracker. Please use the Alexa "
-        "app on your phone to do this."
+        "Your account needs to be linked to Baby Tracker. Please refer to the documentation."
     )
     return {
         "outputSpeech": {
@@ -220,7 +205,7 @@ def _object_id() -> str:
     return str(uuid.uuid1())
 
 
-def _time(dt: datetime.datetime = None) -> str:
+def _format_time(dt: datetime.datetime = None) -> str:
     dt = dt or datetime.datetime.utcnow()
     return dt.strftime("%Y-%m-%d %H:%M:%S +0000")
 
@@ -246,79 +231,10 @@ def login(login_data_) -> requests.Session:
 def generate_transaction(transaction_data, sync_id):
     return {
         "Transaction": base64.b64encode(json.dumps(transaction_data).encode("utf-8"))
-            .decode("utf-8"),
+                             .decode("utf-8"),
         "SyncID": sync_id,
         # This is sometimes 0, sometimes 1. Not sure if ever higher. Not sure what it's for.
         "OPCode": 0
-    }
-
-
-def generate_diaper_data(baby_name, status):
-    return {
-        "BCObjectType": "Diaper",
-        # These default to 5s on some apps (iPhone, I think) and 0s on others (Android?).
-        # They don't seem to be used anywhere, though, so the values we set here don't
-        # seem important.
-        "pooColor": 0,
-        "peeColor": 0,
-        "note": "",
-        # now
-        "timestamp": _time(),
-        "newFlage": "true",
-        "pictureLoaded": "true",
-        # Time of diaper. We could let people provide this time, but at the moment
-        # there doesn't seem like a lot of benefit.
-        "time": _time(),
-        "objectID": _object_id(),
-        "texture": 5,
-        "amount": 2,
-        "baby": BABY_DATA[baby_name.lower()],
-        "flag": 0,
-        "pictureNote": [],
-        "status": status
-    }
-
-
-def generate_formula_data(baby_name: str, amount: float, unit: Unit = Unit.ML):
-    if unit == Unit.CUPS:
-        unit = Unit.OZ
-        amount *= 8
-
-    return {
-      "BCObjectType": "Formula",
-      "amount": {
-        "englishMeasure": str(unit == Unit.OZ).lower(),
-        "value": amount
-      },
-      "baby": BABY_DATA[baby_name.lower()],
-      "note": "",
-      "pictureLoaded": "true",
-      "pictureNote": [],
-      "time": _time(),
-      "newFlage": "true",
-      "objectID": _object_id(),
-      "timestamp": _time()
-    }
-
-
-def generate_nursing_data(baby_name: str,
-                          duration: Union[str, int, datetime.timedelta, isodate.Duration],
-                          breast: Breast = None):
-    duration, minutes = _to_timedelta(duration)
-    return {
-        "BCObjectType": "Nursing",
-        "bothDuration": minutes if breast is None else 0,
-        "finishSide": breast.value if breast else "0",
-        "leftDuration": minutes if breast == Breast.LEFT else 0,
-        "rightDuration": minutes if breast == Breast.RIGHT else 0,
-        "baby": BABY_DATA[baby_name.lower()],
-        "note": "",
-        "pictureLoaded": "true",
-        "pictureNote": [],
-        "time": _time(datetime.datetime.utcnow() - duration),
-        "newFlage": "true",
-        "objectID": _object_id(),
-        "timestamp": _time()
     }
 
 
@@ -333,81 +249,219 @@ def last_sync_id(session):
     return 0
 
 
-def record_diaper(baby_name: str, status: Union[int, str], login_data_):
-    if status is None:
-        raise KeyError("Invalid diaper type")
+class Intent(metaclass=ABCMeta):
+    @abstractmethod
+    def title(self):
+        pass
 
-    if isinstance(status, str):
-        status = DIAPER_STATUS[status]
+    @abstractmethod
+    def success(self, *args, **kwargs):
+        pass
 
-    with login(login_data_) as session:
-        sync_id = last_sync_id(session) + 1
-        session.post(URL + "/account/transaction",
-                     data=json.dumps(generate_transaction(generate_diaper_data(baby_name, status), sync_id)))
+    @abstractmethod
+    def data(self, *args, **kwargs):
+        pass
+
+    @staticmethod
+    def map(intent, login_data_) -> "Intent":
+        intent_name = intent["name"]
+        diaper_intents = {
+            "Diaper": None,
+            "RecordDiaperIntent": None,
+            "Pee": "wet",
+            "Poo": "dirty",
+            "Mixed": "mixed"
+        }
+
+        if intent_name in diaper_intents:
+            return Diaper.parse(diaper_type=diaper_intents[intent_name], intent=intent,
+                                credentials=login_data_)
+        elif intent_name == "Formula":
+            return Formula.parse(intent, login_data_)
+        elif intent_name == "Nursing":
+            return Nursing.parse(intent, login_data_)
+        else:
+            raise ValueError("Invalid intent")
+
+    def __init__(self, intent=None, credentials=None, baby_name=None, time=None):
+        self.baby_name = baby_name or Intent._baby_from_intent(intent)
+        self.credentials = credentials
+        self.intent = intent
+        self.time = time
+
+    @staticmethod
+    def _baby_from_intent(intent):
+        baby = intent["slots"].get("Baby", {}).get("value")
+        if not baby:
+            if len(BABY_DATA) > 1:
+                raise LookupError("Please tell me which baby")
+            elif len(BABY_DATA) == 0:
+                raise LookupError("No babies are set up yet. Refer to the setup instructions.")
+            else:
+                baby = BABY_DATA.keys()[0]
+        return baby
+
+    def record(self, *args, **kwargs):
+        try:
+            data = self.data(*args, **kwargs)
+            with login(self.credentials) as session:
+                sync_id = last_sync_id(session) + 1
+                session.post(URL + "/account/transaction",
+                             data=json.dumps(generate_transaction(data, sync_id)))
+        except Exception as e:
+            return self.say(str(e))
+
+        return self.success(*args, **kwargs)
+
+    def say(self, text):
+        return build_response(build_speechlet_response(self.title(), text))
+
+    def _time(self, dt=None):
+        return _format_time(dt or self.time)
 
 
-def record_formula(baby_name: str, amount: float, unit: Unit, login_data_):
-    formula_data = generate_formula_data(baby_name, amount, unit)
-    with login(login_data_) as session:
-        sync_id = last_sync_id(session) + 1
-        session.post(URL + "/account/transaction",
-                     data=json.dumps(generate_transaction(formula_data, sync_id)))
+class Diaper(Intent):
+    # noinspection PyMethodMayBeStatic
+    def title(self):
+        return "Record Diaper"
+
+    def success(self):
+        return self.say(f"{self.baby_name} had a {self.status} diaper.")
+
+    def __init__(self, diaper_type: str, *args, **kwargs):
+        super(Diaper, self).__init__(*args, **kwargs)
+        self.status = diaper_type
+
+    @staticmethod
+    def parse(intent, credentials, diaper_type=None, *args, **kwargs):
+        return Diaper(diaper_type=diaper_type or intent["slots"]["DiaperType"]["value"],
+                      intent=intent, credentials=credentials, *args, **kwargs)
+
+    def data(self, status: Union[int, str] = None):
+        status = status if status is not None else self.status
+        if isinstance(status, str):
+            status = DIAPER_STATUS[status]
+
+        if status is None:
+            raise KeyError("Invalid diaper type")
+
+        return {
+            "BCObjectType": "Diaper",
+            # These default to 5s on some apps (iPhone, I think) and 0s on others (Android?).
+            # They don't seem to be used anywhere, though, so the values we set here don't
+            # seem important.
+            "pooColor": 0,
+            "peeColor": 0,
+            "note": "",
+            # now
+            "timestamp": self._time(),
+            "newFlage": "true",
+            "pictureLoaded": "true",
+            # Time of diaper. We could let people provide this time, but at the moment
+            # there doesn't seem like a lot of benefit.
+            "time": self._time(),
+            "objectID": _object_id(),
+            "texture": 5,
+            "amount": 2,
+            "baby": BABY_DATA[self.baby_name.lower()],
+            "flag": 0,
+            "pictureNote": [],
+            "status": status
+        }
 
 
-def record_nursing(baby_name: str,
-                   duration: Union[str, int, datetime.timedelta, isodate.Duration],
-                   breast: Breast,
-                   login_data_):
-    nursing_data = generate_nursing_data(baby_name, duration, breast)
-    with login(login_data_) as session:
-        sync_id = last_sync_id(session) + 1
-        session.post(URL + "/account/transaction",
-                     data=json.dumps(generate_transaction(nursing_data, sync_id)))
+class Formula(Intent):
+    def title(self):
+        return "Record Formula"
+
+    def __init__(self, amount, unit: Unit = None, *args, **kwargs):
+        super(Formula, self).__init__(*args, **kwargs)
+        self.amount = float(amount)
+        self.unit = unit or Unit.ML
+
+    @staticmethod
+    def parse(intent, credentials, *args, **kwargs):
+        unit_str = str(intent["slots"]["unit"]["value"]).upper()
+        return Formula(amount=intent["slots"]["number"]["value"],
+                       unit=Unit[unit_str], intent=intent, credentials=credentials, *args, **kwargs)
+
+    def data(self):
+        unit = self.unit
+        amount = self.amount
+
+        if unit == Unit.CUPS:
+            unit = Unit.OZ
+            amount *= 8
+
+        return {
+            "BCObjectType": "Formula",
+            "amount": {
+                "englishMeasure": str(unit == Unit.OZ).lower(),
+                "value": amount
+            },
+            "baby": BABY_DATA[self.baby_name.lower()],
+            "note": "",
+            "pictureLoaded": "true",
+            "pictureNote": [],
+            "time": self._time(),
+            "newFlage": "true",
+            "objectID": _object_id(),
+            "timestamp": self._time()
+        }
+
+    def success(self, *args, **kwargs):
+        plural = "" if self.amount == 1 else "s"
+        return self.say(
+            f"{self.baby_name} drank {self.amount:0.3g} {self.unit.value}{plural} of formula.")
 
 
-# Intents -- these are somewhere between being on the Alexa side and being on the Baby Tracker side
-def record_diaper_intent(intent, diaper_type: Union[int, str] = None):
-    baby = intent["slots"]["Baby"]["value"]
-    diaper_type = diaper_type or intent["slots"]["DiaperType"]["value"]
-    login_data_ = login_data(EMAIL, PASSWORD, DEVICE_UUID)
-    if login_data_ is None:
-        return build_response(build_link_account_response())
-    record_diaper(baby, diaper_type, login_data_)
-    return build_response(build_speechlet_response(
-        "Record Diaper", f"{baby} had a {diaper_type} diaper."))
+class Nursing(Intent):
+    def title(self):
+        return "Record Nursing"
 
+    def __init__(self,
+                 duration: Union[datetime.timedelta, int, str, isodate.Duration],
+                 direction: Breast = None, *args, **kwargs):
+        super(Nursing, self).__init__(*args, **kwargs)
+        self.duration, self.minutes = _to_timedelta(duration)
+        self.direction = direction or Breast.LEFT
 
-def record_formula_intent(intent):
-    baby = intent["slots"]["Baby"]["value"]
-    amount = float(intent["slots"]["number"]["value"])
-    unit_str = str(intent["slots"]["unit"]["value"]).upper()
-    unit = Unit[unit_str]
-    login_data_ = login_data(EMAIL, PASSWORD, DEVICE_UUID)
-    if login_data_ is None:
-        return build_response(build_link_account_response())
-    record_formula(baby, amount, unit, login_data_)
-    plural = "" if amount == 1 else "s"
-    return build_response(build_speechlet_response(
-        "Record Formula", f"{baby} drank {amount:0.3g} {unit.value}{plural} of formula."))
+    @staticmethod
+    def parse(intent, credentials, *args, **kwargs):
+        direction_str = intent["slots"].get("direction", {}).get("value")
+        return Nursing(duration=intent["slots"]["duration"]["value"],
+                       direction=Breast[direction_str.upper()] if direction_str else None,
+                       intent=intent, credentials=credentials, *args, **kwargs)
 
+    def data(self):
+        duration = self.duration
+        minutes = self.minutes
+        breast = self.direction
+        return {
+            "BCObjectType": "Nursing",
+            "bothDuration": minutes if breast is None else 0,
+            "finishSide": breast.value if breast else "0",
+            "leftDuration": minutes if breast == Breast.LEFT else 0,
+            "rightDuration": minutes if breast == Breast.RIGHT else 0,
+            "baby": BABY_DATA[self.baby_name.lower()],
+            "note": "",
+            "pictureLoaded": "true",
+            "pictureNote": [],
+            "time": self._time(datetime.datetime.utcnow() - duration),
+            "newFlage": "true",
+            "objectID": _object_id(),
+            "timestamp": self._time()
+        }
 
-def record_nursing_intent(intent):
-    baby = intent["slots"]["Baby"]["value"]
-    duration, minutes = _to_timedelta(intent["slots"]["duration"]["value"])
-    direction_str = str(intent["slots"]["direction"]["value"]).upper()
-    direction = Breast[direction_str]
-    direction_speech = f" on the {direction_str}" if direction else ""
-    login_data_ = login_data(EMAIL, PASSWORD, DEVICE_UUID)
-    if login_data_ is None:
-        return build_response(build_link_account_response())
-    record_nursing(baby, duration, direction, login_data_)
-    plural = "" if duration == 1 else "s"
-    return build_response(build_speechlet_response(
-        "Record Nursing", f"{baby} fed {minutes} minute{plural}{direction_speech}."))
+    def success(self, *args, **kwargs):
+        plural = "" if self.duration == 1 else "s"
+        direction_str = self.direction.name.lower()
+        direction_speech = f" on the {direction_str}" if self.direction else ""
+        return self.say(f"{self.baby_name} fed {self.minutes} minute{plural}{direction_speech}.")
 
 
 if __name__ == "__main__":
-    record_diaper("2", 0, login_data(EMAIL, PASSWORD, DEVICE_UUID))
-    # record_formula("2", 1.5, Unit.OZ, login_data(EMAIL, PASSWORD, DEVICE_UUID))
-    # record_nursing("1", "PT5M", Breast.RIGHT, login_data(EMAIL, PASSWORD, DEVICE_UUID))
-
+    creds = login_data(EMAIL, PASSWORD, DEVICE_UUID)
+    Diaper(baby_name="1", diaper_type="wet", credentials=creds).record()
+    # Formula(baby_name="2", amount=1.5, unit=Unit.OZ, credentials=creds).record()
+    # Nursing(baby_name="1", duration="PT7M", direction=None, credentials=creds).record()
