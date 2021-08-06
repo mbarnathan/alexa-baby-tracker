@@ -142,7 +142,11 @@ def on_intent(intent_request, session):
     if credentials is None:
         return build_response(build_link_account_response())
 
-    return Intent.map(intent, credentials).record()
+    try:
+        return Intent.map(intent, credentials).record()
+    except ValueError as e:
+        print(e)
+        return build_response(build_speechlet_response("Baby Tracker", "Sorry, I didn't get that."))
 
 
 def build_speechlet_response(title, output, reprompt_text=None, should_end_session=True):
@@ -281,7 +285,7 @@ class Intent(metaclass=ABCMeta):
         elif intent_name == "Nursing":
             return Nursing.parse(intent, login_data_)
         else:
-            raise ValueError("Invalid intent")
+            raise ValueError(f"Invalid intent: {intent_name}")
 
     def __init__(self, intent=None, credentials=None, baby_name=None, time=None):
         self.baby_name = baby_name or Intent._baby_from_intent(intent)
