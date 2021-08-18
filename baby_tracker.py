@@ -7,16 +7,22 @@ http://nighp.com/babytracker/
 import base64
 import datetime
 import json
+import re
+
+import sys
 import uuid
 from abc import ABCMeta, abstractmethod
 from enum import Enum
 from typing import Union, Tuple
 
+import arrow
 import isodate
 import requests
 
 
 # Define singular values; the app will pluralize them as needed.
+
+
 class Unit(Enum):
     MILLILITER = "milliliter"
     MILLILITERS = "milliliter"
@@ -144,8 +150,8 @@ def on_intent(intent_request, session):
 
     try:
         return Intent.map(intent, credentials).record()
-    except ValueError as e:
-        print(e)
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
         return build_response(build_speechlet_response("Baby Tracker", "Sorry, I didn't get that."))
 
 
@@ -157,9 +163,9 @@ def build_speechlet_response(title, output, reprompt_text=None, should_end_sessi
         },
         "card": {
             "type": "Simple",
-            # TODO: Make these more resonable for this app.
-            "title": "SessionSpeechlet - " + title,
-            "content": "SessionSpeechlet - " + output
+            # TODO: Make these more reasonable for this app.
+            "title": f"Baby Tracker - {title}",
+            "content": output
         },
         "reprompt": {
             "outputSpeech": {
@@ -204,6 +210,8 @@ def build_response(response):
 
 ## Baby Tracker Sync -- these functions are on the Baby Tracker side of the skill.
 
+DT_FORMAT = "%Y-%m-%d %H:%M:%S +0000"
+
 
 def _object_id() -> str:
     return str(uuid.uuid1())
@@ -211,7 +219,11 @@ def _object_id() -> str:
 
 def _format_time(dt: datetime.datetime = None) -> str:
     dt = dt or datetime.datetime.utcnow()
-    return dt.strftime("%Y-%m-%d %H:%M:%S +0000")
+    return dt.strftime(DT_FORMAT)
+
+
+def _parse_time(timestr: str) -> datetime.datetime:
+    return datetime.datetime.strptime(timestr, DT_FORMAT)
 
 
 def _to_timedelta(duration: Union[str, int, datetime.timedelta, isodate.Duration]) \
@@ -242,15 +254,23 @@ def generate_transaction(transaction_data, sync_id):
     }
 
 
+def parse_transaction(transaction_data):
+    return json.loads(base64.b64decode(transaction_data))
+
+
 def last_sync_id(session):
-    response = session.get(URL + "/account/device")
-    if response.text == "Unauthorized":
-        raise PermissionError("Couldn't authenticate with BabyTracker")
-    devices = json.loads(response.text)
-    for device in devices:
+    _devices = devices(session)
+    for device in _devices:
         if device["DeviceUUID"] == DEVICE_UUID:
             return device["LastSyncID"]
     return 0
+
+
+def devices(session):
+    response = session.get(URL + "/account/device")
+    if response.text == "Unauthorized":
+        raise PermissionError("Couldn't authenticate with BabyTracker")
+    return json.loads(response.text)
 
 
 class Intent(metaclass=ABCMeta):
@@ -284,6 +304,8 @@ class Intent(metaclass=ABCMeta):
             return Formula.parse(intent, login_data_)
         elif intent_name == "Nursing":
             return Nursing.parse(intent, login_data_)
+        elif intent_name == "LastFeed":
+            return GetLastFeed.parse(intent, login_data_)
         else:
             raise ValueError(f"Invalid intent: {intent_name}")
 
@@ -464,8 +486,82 @@ class Nursing(Intent):
         return self.say(f"{self.baby_name} fed {self.minutes} minute{plural}{direction_speech}.")
 
 
+class GetLastFeed(Intent):
+    def title(self):
+        return "Get Last Feed"
+
+    @staticmethod
+    def bottle_response(tr):
+        unit = "ounces" if str(tr["amount"]["englishMeasure"]) == "true" else "milliliters"
+        value = round(tr["amount"]["value"])
+        if value == 1:
+            unit = unit.rstrip("s")
+        return f"drank {value} {unit}"
+
+    FEEDOBJECTS = {
+        "Nursing": lambda tr: f"fed for {tr.bothDuration} minutes",
+        "Formula": lambda tr: GetLastFeed.bottle_response(tr) + " of formula",
+        "Expressed": lambda tr: GetLastFeed.bottle_response(tr) + " of expressed milk"
+    }
+
+    @staticmethod
+    def parse(intent, credentials, *args, **kwargs):
+        return GetLastFeed(intent=intent, credentials=credentials, *args, **kwargs)
+
+    def record(self, *args, **kwargs):
+        lookback = 25
+        responses = []
+
+        try:
+            with login(self.credentials) as session:
+                _devices = ((device["DeviceUUID"], device["LastSyncID"])
+                            for device in devices(session))
+                for device, sync_id in _devices:
+                    sync_id = max(sync_id - lookback, 1)
+                    responses += session.get(f"{URL}/account/transaction/{device}/{sync_id}").json()
+            transactions = [parse_transaction(response["Transaction"]) for response in responses]
+            for transaction in sorted(transactions, key=lambda t: t.get("time", "0000"),
+                                      reverse=True):
+                if transaction.get("BCObjectType") in GetLastFeed.FEEDOBJECTS \
+                        and transaction["baby"]["name"].lower() == self.baby_name.lower():
+                    # Last feed event for this baby
+                    return self.success(transaction)
+            return self.say(f"No recent feedings for {self.baby_name}")
+        except Exception as e:
+            return self.say(str(e))
+
+    def data(self):
+        raise NotImplementedError("There is no outbound data for a last feed query")
+
+    def success(self, transaction, *args, **kwargs):
+        feed_response = GetLastFeed.FEEDOBJECTS[transaction.get("BCObjectType")](transaction)
+        tr_time = arrow.get(_parse_time(transaction["time"]))
+        ago = (arrow.get(self.time) if self.time else arrow.utcnow()) - tr_time
+        seconds_ago = ago.total_seconds()
+
+        if seconds_ago < 60:
+            granularity = ["second"]
+        elif seconds_ago < 120:
+            granularity = ["minute", "second"]
+        elif seconds_ago < 3600:
+            granularity = ["minute"]
+        elif seconds_ago < 36000:
+            granularity = ["hour", "minute"]
+        elif seconds_ago < 86400:
+            granularity = ["hour"]
+        elif seconds_ago < 172800:
+            granularity = ["day", "hour"]
+        else:
+            granularity = None
+
+        ago_str = tr_time.humanize(granularity=granularity, only_distance=True)
+        ago_str = re.sub(r' and 0.*', "", ago_str)  # We don't want "a day and 0 hours ago"
+        return self.say(f"{self.baby_name} last {feed_response} {ago_str} ago")
+
+
 if __name__ == "__main__":
     creds = login_data(EMAIL, PASSWORD, DEVICE_UUID)
-    Diaper(baby_name="1", diaper_type="wet", credentials=creds).record()
+    # Diaper(baby_name="1", diaper_type="wet", credentials=creds).record()
     # Formula(baby_name="2", amount=1.5, unit=Unit.OZ, credentials=creds).record()
     # Nursing(baby_name="1", duration="PT7M", direction=None, credentials=creds).record()
+    # print(GetLastFeed(baby_name="2", credentials=creds).record())
